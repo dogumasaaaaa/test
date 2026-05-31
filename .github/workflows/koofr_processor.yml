@@ -1,0 +1,207 @@
+name: Koofr Video Processor and Compressor
+
+on:
+  workflow_dispatch: # Allows you to run this manually whenever you want
+
+jobs:
+  process-videos:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-python-version: '3.10'
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ffmpeg curl
+        pip install requests
+
+    - name: Run Video Processor Script
+      env:
+        SOURCE_USER: "terdterd333@gmail.com"
+        SOURCE_PASS: "539zcnjnqlqi2a3d"
+        DEST_USER: "kez.o.o.ist.unl.i@gmail.com"
+        DEST_PASS: "ibvcgsmuw8acqzzz"
+      run: |
+        cat << 'EOF' > process_videos.py
+        import os
+        import re
+        import string
+        import random
+        import xml.etree.ElementTree as ET
+        import requests
+        from requests.auth import HTTPBasicAuth
+
+        # Environment variables
+        SOURCE_USER = os.getenv("SOURCE_USER")
+        SOURCE_PASS = os.getenv("SOURCE_PASS")
+        DEST_USER = os.getenv("DEST_USER")
+        DEST_PASS = os.getenv("DEST_PASS")
+
+        WEBDAV_URL = "https://app.koofr.net/dav/Koofr/"
+        VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.avi', '.mov', '.flv', '.wmv', '.m4v')
+
+        def generate_random_string(length=12):
+            # Numbers and letters only, no symbols, no spaces
+            chars = string.ascii_letters + string.digits
+            return ''.join(random.choice(chars) for _ in range(length))
+
+        def get_video_files():
+            print("Listing files from source Koofr account...")
+            # PROPFIND request to get files in the root directory
+            headers = {"Depth": "1"}
+            response = requests.request("PROPFIND", WEBDAV_URL, auth=HTTPBasicAuth(SOURCE_USER, SOURCE_PASS), headers=headers)
+            
+            if response.status_code not in [207, 200]:
+                print(f"Failed to list files. Status code: {response.status_code}")
+                return []
+
+            # Parse WebDAV XML response
+            try:
+                root = ET.fromstring(response.content)
+            except Exception as e:
+                print(f"Failed to parse XML: {e}")
+                return []
+
+            videos = []
+            # WebDAV uses namespaces, find hrefs
+            for href_node in root.findall(".//{DAV:}href"):
+                url_path = href_node.text
+                # Decode URL spaces/characters
+                decoded_path = requests.utils.unquote(url_path)
+                filename = os.path.basename(decoded_path.rstrip('/'))
+                
+                if filename and filename.lower().endswith(VIDEO_EXTENSIONS):
+                    videos.append(filename)
+            
+            return videos
+
+        def rename_remote_file(old_name, new_name):
+            print(f"Renaming remote file '{old_name}' to '{new_name}'...")
+            source_file_url = f"{WEBDAV_URL}{requests.utils.quote(old_name)}"
+            dest_file_url = f"{WEBDAV_URL}{requests.utils.quote(new_name)}"
+            
+            headers = {"Destination": dest_file_url}
+            response = requests.request("MOVE", source_file_url, auth=HTTPBasicAuth(SOURCE_USER, SOURCE_PASS), headers=headers)
+            
+            if response.status_code in [201, 204]:
+                print("Successfully renamed on source.")
+                return True
+            else:
+                print(f"Failed to rename. Status: {response.status_code}")
+                return False
+
+        def download_file(filename):
+            print(f"Downloading {filename}...")
+            file_url = f"{WEBDAV_URL}{requests.utils.quote(filename)}"
+            response = requests.get(file_url, auth=HTTPBasicAuth(SOURCE_USER, SOURCE_PASS), stream=True)
+            
+            if response.status_code == 200:
+                with open(filename, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                print("Download finished.")
+                return True
+            else:
+                print(f"Failed to download. Status: {response.status_code}")
+                return False
+
+        def compress_video(filename, target_size_mb=95):
+            # Target size in bits (safely under 100 MB)
+            target_size_bits = target_size_mb * 1024 * 1024 * 8
+            
+            # Use ffprobe to find the video duration
+            import subprocess
+            cmd = f"ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 \"{filename}\""
+            duration = float(subprocess.check_output(cmd, shell=True).decode().strip())
+            
+            # Calculate required bitrate in bits per second
+            # Total bitrate = Video bitrate + Audio bitrate. We'll allocate 128k to audio.
+            audio_bitrate = 128000
+            video_bitrate = int((target_size_bits / duration) - audio_bitrate)
+            
+            if video_bitrate < 100000: # Base minimum floor rule to prevent crashes on massive files
+                video_bitrate = 100000
+
+            compressed_filename = f"compressed_{filename}"
+            print(f"Compressing {filename} to fit under {target_size_mb}MB (Target Bitrate: {video_bitrate // 1000}k)...")
+            
+            # 2-pass compression with ffmpeg for precise size targets
+            pass1_cmd = f"ffmpeg -y -i \"{filename}\" -c:v libx264 -b:v {video_bitrate} -pass 1 -an -f null /dev/null"
+            pass2_cmd = f"ffmpeg -y -i \"{filename}\" -c:v libx264 -b:v {video_bitrate} -pass 2 -c:a aac -b:a {audio_bitrate} \"{compressed_filename}\""
+            
+            subprocess.run(pass1_cmd, shell=True)
+            subprocess.run(pass2_cmd, shell=True)
+            
+            # Clean up ffmpeg log files
+            if os.path.exists("ffmpeg2pass-0.log"): os.remove("ffmpeg2pass-0.log")
+            if os.path.exists("ffmpeg2pass-0.log.mbtree"): os.remove("ffmpeg2pass-0.log.mbtree")
+            
+            return compressed_filename
+
+        def upload_to_destination(local_filepath, remote_filename):
+            print(f"Uploading {remote_filename} to destination Koofr account...")
+            dest_url = f"{WEBDAV_URL}{requests.utils.quote(remote_filename)}"
+            
+            with open(local_filepath, 'rb') as f:
+                response = requests.put(dest_url, auth=HTTPBasicAuth(DEST_USER, DEST_PASS), data=f)
+                
+            if response.status_code in [200, 201, 204]:
+                print("Upload to destination successful.")
+                return True
+            else:
+                print(f"Upload failed. Status: {response.status_code}")
+                return False
+
+        def main():
+            videos = get_video_files()
+            if not videos:
+                print("No videos found to process.")
+                return
+
+            print(f"Found {len(videos)} video(s) to process.")
+
+            for video in videos:
+                print("\n-------------------------------------------")
+                print(f"Processing: {video}")
+                
+                # 1. Create random alphanumeric string name retaining extension
+                ext = os.path.splitext(video)[1]
+                random_name = generate_random_string() + ext.lower()
+                
+                # 2. Rename file on source account
+                if not rename_remote_file(video, random_name):
+                    continue # Skip if rename failed
+                
+                # 3. Download the renamed file
+                if not download_file(random_name):
+                    continue
+                
+                # 4. Check file size
+                file_size_mb = os.path.getsize(random_name) / (1024 * 1024)
+                file_to_upload = random_name
+                
+                if file_size_mb > 100:
+                    print(f"File size is {file_size_mb:.2f} MB (Over 100 MB). Starting compression...")
+                    file_to_upload = compress_video(random_name)
+                else:
+                    print(f"File size is {file_size_mb:.2f} MB (Under 100 MB). Compression skipped.")
+                
+                # 5. Upload to the destination account
+                upload_to_destination(file_to_upload, random_name)
+                
+                # 6. Clean up runner storage space
+                if os.path.exists(random_name): os.remove(random_name)
+                if file_to_upload != random_name and os.path.exists(file_to_upload):
+                    os.remove(file_to_upload)
+
+        if __name__ == "__main__":
+            main()
+        EOF
+        python process_videos.py
