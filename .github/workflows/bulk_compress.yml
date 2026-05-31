@@ -1,0 +1,100 @@
+name: Bulk Video Compression Pipeline
+
+on:
+  workflow_dispatch: # Allows manual trigger from the GitHub web UI
+
+jobs:
+  bulk_process:
+    runs-on: ubuntu-latest
+
+    env:
+      # --- SOURCE KOOFR ACCOUNT ---
+      SRC_USER: "lo.t.st.upidk.aely@gmail.com"
+      SRC_PASS: "2eio48c7cr7akj6b"
+      SRC_BASE_URL: "https://app.koofr.net/dav/Koofr"
+
+      # --- DESTINATION KOOFR ACCOUNT ---
+      # Replace these with your target account's credentials
+      DEST_USER: "mf.y.dk745@gmail.com"
+      DEST_PASS: "twkuw4cdrkwx8wnp"
+      DEST_BASE_URL: "https://app.koofr.net/dav/Koofr"
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg curl xmlstarlet
+
+      - name: Read Source Files and Process Loop
+        run: |
+          echo "Scanning root directory of Source Koofr account via WebDAV..."
+          
+          # 1. Fetch directory listing using WebDAV PROPFIND
+          # 2. Extract paths using xmlstarlet to avoid fragile regex matching
+          curl -s -u "$SRC_USER:$SRC_PASS" -X PROPFIND \
+            --header "Depth: 1" \
+            "$SRC_BASE_URL/" > directory_list.xml
+
+          # Extract all href paths from the XML structure
+          xmlstarlet sel -N d="DAV:" -t -m "//d:href" -v "." -n directory_list.xml > paths.txt
+
+          echo "Found objects in remote root. Filtering for videos..."
+
+          # Create directories to organize workspace inside the runner
+          mkdir -p ./downloads ./compressed
+
+          # Loop through every extracted item
+          while IFS= read -r encoded_path; do
+            # Clean up trailing spaces or returns
+            encoded_path=$(echo "$encoded_path" | tr -d '\r\n')
+            
+            # Decode URL path segments to isolate the clean file name
+            filename=$(basename "$(printf '%b' "${encoded_path//%/\\x}")")
+
+            # Check if file has a typical video extension (case-insensitive)
+            if [[ "$filename" =~ \.(mp4|mkv|mov|avi|wmv|flv|webm)$ ]]; then
+              echo "--------------------------------------------------"
+              echo "🎥 Found Target Video: $filename"
+              echo "--------------------------------------------------"
+
+              # Target file paths inside the runner environment
+              local_input="./downloads/$filename"
+              local_output="./compressed/$filename"
+
+              # Escape full remote URL for curl tracking down specific file paths
+              # Koofr returns full paths starting from /dav/Koofr/file.mp4, so we append to root domain
+              full_src_url="https://app.koofr.net$encoded_path"
+
+              echo "📥 Downloading: $filename ..."
+              if curl -f -sL -u "$SRC_USER:$SRC_PASS" "$full_src_url" -o "$local_input"; then
+                
+                echo "⚙️ Compressing ($filename) with FIXED CRF 30..."
+                # High-efficiency processing scaled down to a maximum of 720p width to match CRF 30 intents
+                ffmpeg -y -i "$local_input" \
+                  -vcodec libx264 \
+                  -crf 30 \
+                  -vf "scale='min(1280,iw)':-2" \
+                  -acodec aac \
+                  -b:a 128k \
+                  "$local_output"
+
+                echo "📤 Uploading compressed version to Destination Cloud..."
+                curl -f -s -u "$DEST_USER:$DEST_PASS" \
+                  -T "$local_output" \
+                  "$DEST_BASE_URL/$filename"
+
+                echo "✅ Successfully completed: $filename"
+                
+                # Cleanup immediate files to conserve runner disk space
+                rm -f "$local_input" "$local_output"
+              else
+                echo "❌ Failed downloading $filename, skipping to next item."
+              fi
+            fi
+          done < paths.txt
+
+          echo "--------------------------------------------------"
+          echo "🏁 Bulk pipeline run finished!"
