@@ -31,26 +31,28 @@ jobs:
         run: |
           echo "Scanning root directory of Source Koofr account via WebDAV..."
           
-          # Fetch directory listing from the source account
+          # Fetch the directory XML payload from the source account
           curl -s -u "$SRC_USER:$SRC_PASS" -X PROPFIND \
             --header "Depth: 1" \
             "$SRC_BASE_URL/" > directory_list.xml
 
-          # Extract all href paths safely
+          # Extract all raw href paths safely from the XML DOM structure
           xmlstarlet sel -N d="DAV:" -t -m "//d:href" -v "." -n directory_list.xml > paths.txt
 
           echo "Found objects in remote root. Filtering for videos..."
 
+          # Build local clean workspace paths
           mkdir -p ./downloads ./compressed
 
           while IFS= read -r encoded_path; do
+            # Trim formatting lines or system carriage returns
             encoded_path=$(echo "$encoded_path" | tr -d '\r\n')
             [ -z "$encoded_path" ] && continue
             
-            # Cleanly decode the URL paths to extract raw file names
+            # Safely decode the raw URL path to display a clean title in the logs
             filename=$(basename "$(printf '%b' "${encoded_path//%/\\x}")")
 
-            # Match extensions case-insensitively
+            # Check if file has a typical video extension (case-insensitive)
             if [[ "$filename" =~ \.(mp4|mkv|mov|avi|wmv|flv|webm)$ ]]; then
               echo "--------------------------------------------------"
               echo "🎥 Found Target Video: $filename"
@@ -58,15 +60,15 @@ jobs:
 
               local_input="./downloads/$filename"
               local_output="./compressed/$filename"
-
-              # Re-construct the clean target URL
+              
+              # Construct the direct source download URL using the safe encoded path
               full_src_url="https://app.koofr.net${encoded_path}"
 
               echo "📥 Downloading: $filename ..."
               if curl -f -sL -u "$SRC_USER:$SRC_PASS" "$full_src_url" -o "$local_input"; then
                 
                 echo "⚙️ Compressing ($filename) with FIXED CRF 30..."
-                # -nostdin prevents ffmpeg from breaking the while loop
+                # -nostdin completely blocks ffmpeg from consuming loop lines
                 ffmpeg -nostdin -y -i "$local_input" \
                   -vcodec libx264 \
                   -crf 30 \
@@ -76,16 +78,20 @@ jobs:
                   "$local_output"
 
                 echo "📤 Uploading compressed version to Destination Cloud..."
-                curl -f -s -u "$DEST_USER:$DEST_PASS" \
-                  -T "$local_output" \
-                  "$DEST_BASE_URL/$filename"
+                # Extracts the exact web-safe encoded file string for the destination endpoint URL
+                pure_encoded_filename=$(basename "$encoded_path")
+                full_dest_url="$DEST_BASE_URL/$pure_encoded_filename"
 
-                echo "✅ Successfully completed: $filename"
+                if curl -f -s -u "$DEST_USER:$DEST_PASS" -T "$local_output" "$full_dest_url"; then
+                  echo "✅ Successfully completed: $filename"
+                else
+                  echo "❌ Upload failed for: $filename"
+                fi
                 
-                # Clean up local runner space immediately
+                # Immediate local storage wipe to prevent workflow disk overflow
                 rm -f "$local_input" "$local_output"
               else
-                echo "❌ Failed downloading or locating file, skipping to next item."
+                echo "❌ Failed downloading or locating file ($filename), skipping to next item."
               fi
             fi
           done < paths.txt
